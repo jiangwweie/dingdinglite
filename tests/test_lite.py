@@ -536,3 +536,72 @@ class TestConstants:
     def test_config_file(self):
         """测试配置文件名"""
         assert CONFIG_FILE == "config.yaml"
+
+
+# =============================================================================
+# TestSchedulerIntegration 测试类
+# =============================================================================
+
+class TestSchedulerIntegration:
+    """测试调度器集成"""
+
+    @pytest.mark.asyncio
+    async def test_scheduler_kline_callback_triggered(self):
+        """验证调度器在 K 线闭合时触发回调"""
+        from lite import ExchangeGateway, KlineData
+        from decimal import Decimal
+        from unittest.mock import MagicMock, AsyncMock, patch
+        import asyncio
+
+        # Mock 闭合时刻判断和 K 线闭合验证
+        with patch('scheduler.is_kline_close_time', return_value=True):
+            with patch('scheduler.is_kline_closed', return_value=True):
+                # 创建测试配置
+                exchange_config = MagicMock()
+                exchange_config.api_key = "test_key"
+                exchange_config.api_secret = "test_secret"
+                exchange_config.testnet = True
+
+                gateway = ExchangeGateway(exchange_config)
+
+                # Mock 交易所连接
+                mock_exchange = AsyncMock()
+                mock_exchange.load_markets = AsyncMock()
+                mock_exchange.fetch_ohlcv = AsyncMock(return_value=[
+                    [100000000000, 50000, 51000, 49000, 50500, 1000],  # 已闭合
+                    [100000900000, 50500, 51500, 50000, 51000, 1000],  # 未闭合
+                ])
+                gateway.exchange = mock_exchange
+
+                # 记录回调
+                callback_called = []
+
+                async def callback(kline: KlineData):
+                    callback_called.append(kline)
+                    # 收到回调后退出循环
+                    raise asyncio.CancelledError("Test complete")
+
+                # 创建任务并在收到回调后取消
+                task = asyncio.create_task(
+                    gateway.subscribe_klines(
+                        ["BTC/USDT:USDT"],
+                        ["15m"],
+                        callback
+                    )
+                )
+
+                # 等待一小段时间让回调执行
+                await asyncio.sleep(0.1)
+
+                # 取消任务
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+                # 验证回调被调用
+                assert len(callback_called) > 0
+                assert callback_called[0].symbol == "BTC/USDT:USDT"
+                assert callback_called[0].timeframe == "15m"
+                assert callback_called[0].is_closed is True
