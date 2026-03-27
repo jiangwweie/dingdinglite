@@ -1,5 +1,6 @@
 """同步轮询调度器 - K 线闭合时刻检测"""
 import time
+import pytz
 from datetime import datetime
 from typing import Optional
 
@@ -11,9 +12,17 @@ TIMEFRAME_MINUTES = {
     "4h": 240,
 }
 
+# 北京时间时区
+BEIJING_TZ = pytz.timezone("Asia/Shanghai")
+
+
+def get_beijing_now() -> datetime:
+    """获取北京时间"""
+    return datetime.now(BEIJING_TZ)
+
 
 def is_kline_close_time(timeframe: str) -> bool:
-    """判断当前时间是否是指定周期的 K 线闭合时刻
+    """判断当前时间是否是指定周期的 K 线闭合时刻（北京时间）
 
     Args:
         timeframe: 周期，如 "15m", "1h", "4h"
@@ -22,7 +31,7 @@ def is_kline_close_time(timeframe: str) -> bool:
         True: 当前是闭合时刻，应该读取 K 线
         False: 不是闭合时刻，继续等待
     """
-    now = datetime.now()
+    now = get_beijing_now()
 
     # 15m: XX:14:59, XX:29:59, XX:44:59, XX:59:59
     if timeframe == "15m":

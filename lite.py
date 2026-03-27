@@ -3,6 +3,8 @@ import asyncio
 import logging
 import os
 import time
+import datetime
+import pytz
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
@@ -29,11 +31,16 @@ HIGHER_TIMEFRAME_MAP = {
     "4h": "1d"
 }
 
-# 冷却时间（5 分钟）
-COOLDOWN_SECONDS = 300
+# 冷却时间（2 分钟）
+COOLDOWN_SECONDS = 120
 
 # 版本
 VERSION = "v0.1.0"
+
+# 全局计数器
+klines_checked = 0
+signals_found = 0
+last_status_time = 0
 
 
 # =============================================================================
@@ -53,21 +60,28 @@ def setup_logging() -> logging.Logger:
 
     # 配置日志
     logger = logging.getLogger("dingpang-lite")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)  # 允许 DEBUG 日志通过
 
     # 清空已有处理器
     logger.handlers.clear()
 
-    # 文件处理器
+    # 文件处理器 - 记录 DEBUG 级别 (使用北京时间)
     file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+    # 使用北京时间 (UTC+8)
+    beijing_tz = pytz.timezone("Asia/Shanghai")
+    def beijing_converter(*args):
+        import datetime
+        return beijing_tz.localize(datetime.datetime(*args[:6])).timetuple()
+    file_handler.converter = beijing_converter
     logger.addHandler(file_handler)
 
-    # 终端处理器
+    # 终端处理器 - 显示 DEBUG 级别 (使用北京时间)
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+    console_handler.converter = beijing_converter
     logger.addHandler(console_handler)
 
     return logger
@@ -133,7 +147,7 @@ class ExchangeGateway:
         await self.exchange.load_markets()
 
     async def get_ema(self, symbol: str, timeframe: str, period: int) -> Decimal:
-        """获取 EMA 值（用 SMA 近似简化实现）
+        """获取 EMA 值（指数移动平均线）
 
         Args:
             symbol: 交易对，如 "BTC/USDT:USDT"
@@ -146,17 +160,27 @@ class ExchangeGateway:
         if self.exchange is None:
             raise RuntimeError("交易所未连接，请先调用 connect()")
 
-        # 获取 K 线数据（用于计算 SMA 近似 EMA）
+        # 获取 K 线数据（需要 period 根来计算 EMA）
         ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=period)
 
         if len(ohlcv) < period:
             raise ValueError(f"K 线数据不足：需要{period}根，实际{len(ohlcv)}根")
 
-        # 用 SMA 近似 EMA：取最近 period 根 K 线的收盘价平均值
-        close_prices = [Decimal(str(candle[4])) for candle in ohlcv[-period:]]
-        sma = sum(close_prices) / len(close_prices)
+        # 提取收盘价
+        close_prices = [Decimal(str(candle[4])) for candle in ohlcv]
 
-        return sma
+        # 计算 EMA：EMA = 价格 (t) * k + EMA(t-1) * (1-k)
+        # k = 2 / (period + 1)
+        k = Decimal("2") / Decimal(str(period + 1))
+
+        # 第一个 EMA 用 SMA 近似
+        ema = sum(close_prices[:period]) / Decimal(str(period))
+
+        # 迭代计算后续 EMA
+        for price in close_prices[period:]:
+            ema = price * k + ema * (Decimal("1") - k)
+
+        return ema
 
     async def get_klines(self, symbol: str, timeframe: str, limit: int = 1) -> list:
         """获取 K 线数据
@@ -190,11 +214,19 @@ class ExchangeGateway:
             callback: K 线数据回调函数，接收 KlineData 参数
         """
         from scheduler import is_kline_close_time, is_kline_closed
+        import datetime
 
         self.logger.info("同步轮询调度器启动")
+        loop_count = 0
 
         while True:
             triggered = False
+            loop_count += 1
+
+            # 每 30 秒输出一次心跳
+            if loop_count % 30 == 0:
+                now_str = datetime.datetime.now().strftime("%H:%M:%S")
+                self.logger.info(f"♥ 心跳 [{now_str}] 检查 {klines_checked} 根 K 线，发现 {signals_found} 个信号")
 
             # 检查每个周期是否到达闭合时刻
             for symbol in symbols:
@@ -205,6 +237,7 @@ class ExchangeGateway:
                             ohlcv = await self.get_klines(symbol, timeframe, limit=2)
 
                             if len(ohlcv) < 2:
+                                self.logger.debug(f"[{symbol}] {timeframe} K 线数据不足，跳过")
                                 continue
 
                             # 使用倒数第二根 K 线（确保已闭合）
@@ -229,6 +262,11 @@ class ExchangeGateway:
                                 close=Decimal(str(candle[4])),
                                 volume=Decimal(str(candle[5])),
                                 is_closed=True
+                            )
+
+                            self.logger.debug(
+                                f"[{symbol}] {timeframe} K 线闭合 O={float(candle[1]):.2f} "
+                                f"H={float(candle[2]):.2f} L={float(candle[3]):.2f} C={float(candle[4]):.2f}"
                             )
 
                             await callback(kline)
@@ -280,22 +318,79 @@ class SignalPipeline:
         """
         self.gateway = gateway
 
+    async def initialize_context(self) -> None:
+        """启动时预加载历史 K 线数据，建立 EMA 上下文
+
+        为每个币种和更高周期（1h/4h）预加载 60 根 K 线并计算 EMA
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("开始预加载历史 K 线数据...")
+        self.logger.info("=" * 60)
+
+        # 需要预加载的更高周期（用于 EMA 趋势判断）
+        higher_timeframes = list(set(HIGHER_TIMEFRAME_MAP.values()))
+
+        for symbol in self.config.symbols:
+            for timeframe in higher_timeframes:
+                try:
+                    self.logger.info(f"[{symbol}] 加载 {timeframe} 历史 K 线...")
+
+                    # 获取 EMA 需要 period 根 K 线
+                    ema_period = self.config.strategy.ema_period
+                    ohlcv = await self.gateway.get_klines(symbol, timeframe, limit=ema_period + 10)
+
+                    if len(ohlcv) < ema_period:
+                        self.logger.warning(f"[{symbol}] {timeframe} K 线数据不足：{len(ohlcv)}根，需要{ema_period}根")
+                        continue
+
+                    # 使用最新的 K 线
+                    latest_candle = ohlcv[-1]
+                    close_price = Decimal(str(latest_candle[4]))
+
+                    # 计算 EMA
+                    ema = await self.gateway.get_ema(symbol, timeframe, ema_period)
+
+                    self.context_cache[symbol] = self.context_cache.get(symbol, {})
+                    self.context_cache[symbol][timeframe] = {
+                        "ema": ema,
+                        "close": close_price,
+                        "timestamp": int(latest_candle[0])
+                    }
+
+                    self.logger.info(
+                        f"  ✓ {timeframe} EMA={float(ema):.2f}, Close={float(close_price):.2f}"
+                    )
+
+                except Exception as e:
+                    self.logger.error(f"[{symbol}] {timeframe} 预加载失败：{e}")
+
+        # 输出预加载结果
+        self.logger.info("-" * 60)
+        for symbol, tf_data in self.context_cache.items():
+            for tf, data in tf_data.items():
+                self.logger.info(f"[{symbol}] {tf}: EMA={float(data['ema']):.2f}")
+        self.logger.info("=" * 60)
+        self.logger.info(f"预加载完成，共加载 {sum(len(v) for v in self.context_cache.values())} 个上下文")
+        self.logger.info("=" * 60)
+
     async def on_kline(self, kline: KlineData) -> None:
         """K 线数据回调入口
 
         Args:
             kline: K 线数据
         """
+        global klines_checked
         symbol = kline.symbol
         timeframe = kline.timeframe
+        klines_checked += 1
 
         # 1. 如果是更高周期 K 线（1h/4h/1d），更新上下文
         if timeframe in HIGHER_TIMEFRAME_MAP.values():
             await self._update_context(kline)
 
-        # 2. 如果是监控周期 K 线（15m/1h/4h）且已闭合，检查信号
-        # 注意：轮询模式下 is_closed=False，这里我们检查所有 K 线
+        # 2. 如果是监控周期 K 线（15m/1h/4h），检查信号
         if timeframe in self.config.timeframes:
+            self.logger.debug(f"[{symbol}] {timeframe} 开始检测 Pinbar 信号...")
             await self._check_signal(kline)
 
     async def _update_context(self, kline: KlineData) -> None:
@@ -337,22 +432,32 @@ class SignalPipeline:
         Args:
             kline: K 线数据
         """
+        global signals_found
         symbol = kline.symbol
         timeframe = kline.timeframe
 
         # 获取对应更高周期
         higher_timeframe = HIGHER_TIMEFRAME_MAP.get(timeframe)
         if not higher_timeframe:
+            self.logger.debug(f"[{symbol}] 无更高周期映射，跳过")
             return
 
         # 获取更高周期上下文
         if symbol not in self.context_cache:
+            self.logger.debug(f"[{symbol}] 无上下文缓存，跳过")
             return
 
         if higher_timeframe not in self.context_cache[symbol]:
+            self.logger.debug(f"[{symbol}] {higher_timeframe} 无上下文数据，跳过")
             return
 
         context_data = self.context_cache[symbol][higher_timeframe]
+        ema = context_data.get("ema")
+        close = context_data.get("close")
+
+        self.logger.debug(
+            f"[{symbol}] {higher_timeframe} EMA={float(ema):.2f} Close={float(close):.2f}"
+        )
 
         # 检查冷却
         if self._check_cooldown(symbol, timeframe):
@@ -371,12 +476,15 @@ class SignalPipeline:
         signal = check_pinbar_signal(kline, signal_context)
 
         if signal:
+            signals_found += 1
             self.logger.info(
-                f"[{symbol}] {timeframe} 产生信号：{signal.direction} "
-                f"入场价={float(signal.entry_price):.2f}"
+                f"🎯 [{symbol}] {timeframe} 产生信号：{signal.direction} "
+                f"入场价={float(signal.entry_price):.2f} 止损={float(signal.stop_loss):.2f}"
             )
             await self._notify_signal(signal)
             self._update_cooldown(symbol, timeframe)
+        else:
+            self.logger.debug(f"[{symbol}] {timeframe} 无 Pinbar 信号")
 
     async def _notify_signal(self, signal: SignalResult) -> None:
         """发送飞书通知
@@ -466,7 +574,10 @@ async def main() -> None:
     pipeline = SignalPipeline(config)
     pipeline.set_gateway(gateway)
 
-    # 5. 订阅 K 线
+    # 5. 预加载历史 K 线数据（建立 EMA 上下文）
+    await pipeline.initialize_context()
+
+    # 6. 订阅 K 线
     logger.info(f"订阅 K 线：{config.symbols} ({', '.join(config.timeframes)})")
 
     # 定义 K 线回调
