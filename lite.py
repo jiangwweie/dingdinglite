@@ -115,6 +115,7 @@ class ExchangeGateway:
         """
         self.config = config
         self.exchange: Optional[ccxt.binance] = None
+        self.logger = logging.getLogger("dingpang-lite")
 
     async def connect(self) -> None:
         """初始化 ccxt.binance 交易所"""
@@ -179,41 +180,68 @@ class ExchangeGateway:
         timeframes: list,
         callback
     ) -> None:
-        """订阅 K 线数据（轮询模式）
+        """订阅 K 线数据（同步轮询模式）
+
+        在每个周期的 K 线闭合时刻读取并验证，确保只处理已闭合 K 线。
 
         Args:
             symbols: 交易对列表
             timeframes: 周期列表
             callback: K 线数据回调函数，接收 KlineData 参数
         """
-        # 轮询模式：每隔一定时间获取最新 K 线
+        from scheduler import is_kline_close_time, is_kline_closed
+
+        self.logger.info("同步轮询调度器启动")
+
         while True:
+            triggered = False
+
+            # 检查每个周期是否到达闭合时刻
             for symbol in symbols:
                 for timeframe in timeframes:
-                    try:
-                        # 获取最新一根 K 线
-                        ohlcv = await self.get_klines(symbol, timeframe, limit=1)
-                        if ohlcv and len(ohlcv) > 0:
-                            candle = ohlcv[0]
+                    if is_kline_close_time(timeframe):
+                        try:
+                            # 读取最近 2 根 K 线，使用前一根（确保已闭合）
+                            ohlcv = await self.get_klines(symbol, timeframe, limit=2)
+
+                            if len(ohlcv) < 2:
+                                continue
+
+                            # 使用倒数第二根 K 线（确保已闭合）
+                            candle = ohlcv[-2]
+                            kline_timestamp = int(candle[0])
+
+                            # 验证闭合
+                            if not is_kline_closed(kline_timestamp, timeframe):
+                                self.logger.debug(
+                                    f"[{symbol}] {timeframe} K 线未闭合，跳过"
+                                )
+                                continue
+
+                            # 构建 KlineData
                             kline = KlineData(
                                 symbol=symbol,
                                 timeframe=timeframe,
-                                timestamp=int(candle[0]),
+                                timestamp=kline_timestamp,
                                 open=Decimal(str(candle[1])),
                                 high=Decimal(str(candle[2])),
                                 low=Decimal(str(candle[3])),
                                 close=Decimal(str(candle[4])),
                                 volume=Decimal(str(candle[5])),
-                                is_closed=False  # 轮询模式下默认未闭合
+                                is_closed=True
                             )
-                            await callback(kline)
-                    except Exception as e:
-                        logging.getLogger("dingpang-lite").error(
-                            f"获取 {symbol} {timeframe} K 线失败：{e}"
-                        )
 
-            # 等待 5 秒后再次轮询
-            await asyncio.sleep(5)
+                            await callback(kline)
+                            triggered = True
+
+                        except Exception as e:
+                            logging.getLogger("dingpang-lite").error(
+                                f"获取 {symbol} {timeframe} K 线失败：{e}"
+                            )
+
+            # 如果没有触发任何周期，等待 1 秒
+            if not triggered:
+                await asyncio.sleep(1)
 
     async def close(self) -> None:
         """关闭连接"""
@@ -445,36 +473,11 @@ async def main() -> None:
     async def on_kline_callback(kline: KlineData) -> None:
         await pipeline.on_kline(kline)
 
-    # 6. 保持运行（无限循环）
+    # 6. 保持运行（同步轮询）
     try:
-        # 先手动获取一次初始 K 线数据建立上下文
-        for symbol in config.symbols:
-            for timeframe in config.timeframes:
-                # 获取当前周期的更高周期
-                higher_tf = HIGHER_TIMEFRAME_MAP.get(timeframe)
-                if higher_tf:
-                    try:
-                        ohlcv = await gateway.get_klines(symbol, higher_tf, limit=1)
-                        if ohlcv and len(ohlcv) > 0:
-                            candle = ohlcv[0]
-                            kline = KlineData(
-                                symbol=symbol,
-                                timeframe=higher_tf,
-                                timestamp=int(candle[0]),
-                                open=Decimal(str(candle[1])),
-                                high=Decimal(str(candle[2])),
-                                low=Decimal(str(candle[3])),
-                                close=Decimal(str(candle[4])),
-                                volume=Decimal(str(candle[5])),
-                                is_closed=True
-                            )
-                            await pipeline.on_kline(kline)
-                    except Exception as e:
-                        logger.error(f"初始化 {symbol} {higher_tf} 上下文失败：{e}")
-
         logger.info("系统就绪，开始监控...")
 
-        # 进入轮询循环
+        # 进入同步轮询循环
         await gateway.subscribe_klines(
             config.symbols,
             config.timeframes,
