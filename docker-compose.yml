@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  lite:
+    build: .
+    container_name: dingpang-lite
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+networks:
+  lite-network:
+    driver: bridge

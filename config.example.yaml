@@ -1,0 +1,34 @@
+# 交易所配置
+exchange:
+  name: binance
+  api_key: "YOUR_API_KEY_HERE"
+  api_secret: "YOUR_API_SECRET_HERE"
+  testnet: false  # true = 测试网，false = 实盘
+
+# 监控币种（默认 3 个）
+symbols:
+  - BTC/USDT:USDT
+  - ETH/USDT:USDT
+  - SOL/USDT:USDT
+
+# 监控周期（只能是 15m、1h、4h 的子集）
+timeframes:
+  - 15m
+  - 1h
+  - 4h
+
+# 策略参数
+strategy:
+  ema_period: 60
+  pinbar:
+    min_wick_ratio: 0.6
+    max_body_ratio: 0.3
+
+# 日志配置
+logging:
+  level: INFO
+  file: logs/lite.log
+
+# 通知配置
+notification:
+  feishu_webhook: "YOUR_FEISHU_WEBHOOK_HERE"
