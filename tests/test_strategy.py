@@ -107,15 +107,20 @@ class TestPinbarDetection:
 
     def test_bullish_pinbar_body_too_large(self):
         """看涨 Pinbar 但实体太大"""
-        kline = create_kline(open=90, high=100, low=80, close=90)
-        # 实体 = 10, 总长 = 20, 实体占比 = 50% > 30%
-        assert is_bullish_pinbar(kline) is False
+        # 实体在顶部，但实体占比过大
+        kline = create_kline(open=88, high=100, low=80, close=88)
+        # 总长 = 20
+        # 下影线 = 8, 50% ✓
+        # 实体 = 12, 60% > 35% ✗
+        assert is_bullish_pinbar(kline, min_wick=0.5, max_body=0.35, body_position_tolerance=0.3) is False
 
     def test_bearish_pinbar_wick_too_short(self):
         """看跌 Pinbar 但上影线太短"""
-        kline = create_kline(open=90, high=100, low=80, close=90)
-        # 上影线 = 0, 不满足 >= 60%
-        assert is_bearish_pinbar(kline) is False
+        # 实体在底部，但上影线太短
+        kline = create_kline(open=90, high=95, low=80, close=92)
+        # 总长 = 15
+        # 上影线 = 3, 20% < 50% ✗
+        assert is_bearish_pinbar(kline, min_wick=0.5, max_body=0.35, body_position_tolerance=0.3) is False
 
 
 class TestEmaTrend:
@@ -132,25 +137,25 @@ class TestEmaTrend:
         assert trend == Trend.BEARISH
 
     def test_neutral_trend(self):
-        """close == EMA"""
+        """close == EMA (现在算 BULLISH，更激进)"""
         trend = get_ema_trend(Decimal("100"), Decimal("100"))
-        assert trend == Trend.NEUTRAL
+        assert trend == Trend.BULLISH  # 新逻辑：close >= EMA 算多头
 
 
 class TestStopLoss:
-    """测试止损价计算"""
+    """测试止损价计算（Pinbar 极值点）"""
 
     def test_long_stop_loss(self):
-        """LONG 止损：最低价下方 0.1%"""
+        """LONG 止损：Pinbar 最低价"""
         kline = create_kline(low=100)
         stop_loss = calculate_stop_loss(kline, Direction.LONG)
-        assert stop_loss == Decimal("99.9")  # 100 * 0.999
+        assert stop_loss == Decimal("100")  # 极值点，无缓冲
 
     def test_short_stop_loss(self):
-        """SHORT 止损：最高价上方 0.1%"""
+        """SHORT 止损：Pinbar 最高价"""
         kline = create_kline(high=100)
         stop_loss = calculate_stop_loss(kline, Direction.SHORT)
-        assert stop_loss == Decimal("100.1")  # 100 * 1.001
+        assert stop_loss == Decimal("100")  # 极值点，无缓冲
 
 
 class TestPinbarSignal:
@@ -229,11 +234,13 @@ class TestPinbarSignal:
         assert result is None
 
     def test_no_signal_neutral_trend(self):
-        """中性趋势 = 无信号"""
+        """中性趋势 = 无信号（但现在没有中性趋势了）"""
+        # 新逻辑中 close >= EMA 算 BULLISH，所以这个测试需要调整
+        # 这里测试当 EMA 数据缺失时的情况
         kline = create_kline(open=99, high=100, low=80, close=99.5)  # 看涨 Pinbar
         context = {
-            "ema_higher": Decimal("100"),
-            "close_higher": Decimal("100"),  # close == ema → Neutral
+            "ema_higher": None,  # EMA 数据缺失
+            "close_higher": Decimal("100"),
             "higher_timeframe": "1h",
             "current_timeframe": "15m",
         }
@@ -259,6 +266,6 @@ class TestPinbarSignal:
         assert result.timeframe == "15m"
         assert result.direction == Direction.LONG
         assert result.entry_price == Decimal("99.5")
-        assert result.stop_loss == Decimal("79.92")  # 80 * 0.999
+        assert result.stop_loss == Decimal("80")  # Pinbar 最低价（新逻辑）
         assert result.big_trend == Trend.BULLISH
-        assert result.pinbar_quality > 0.6  # 下影线占比应该 > 60%
+        assert result.pinbar_quality > 0.5  # 下影线占比应该 > 50%

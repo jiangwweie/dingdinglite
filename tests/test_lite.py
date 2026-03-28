@@ -530,8 +530,8 @@ class TestConstants:
         assert HIGHER_TIMEFRAME_MAP["4h"] == "1d"
 
     def test_cooldown_seconds(self):
-        """测试冷却时间"""
-        assert COOLDOWN_SECONDS == 300
+        """测试冷却时间（2 分钟）"""
+        assert COOLDOWN_SECONDS == 120
 
     def test_config_file(self):
         """测试配置文件名"""

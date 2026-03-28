@@ -36,19 +36,18 @@ def calculate_wick_ratio(kline: KlineData) -> tuple[Decimal, Decimal, Decimal]:
     return upper_ratio, lower_ratio, body_ratio
 
 
-def is_bullish_pinbar(kline: KlineData, min_wick: float = 0.5, max_body: float = 0.4) -> bool:
+def is_bullish_pinbar(kline: KlineData, min_wick: float = 0.5, max_body: float = 0.35, body_position_tolerance: float = 0.3) -> bool:
     """
-    检测看涨 Pinbar（长下影线，实体在顶部）
+    检测看涨 Pinbar（长下影线，实体允许在中间）
     条件:
         - 下影线占比 >= min_wick (默认 50%)
-        - 实体占比 <= max_body (默认 40%)
-        - 实体位于 K 线顶部 20% 区间
+        - 实体占比 <= max_body (默认 35%)
+        - 实体位于 K 线下半部分（位置 >= 50% - tolerance，即 >= 20%）
     """
     import logging
     logger = logging.getLogger("dingpang-lite")
 
     upper_ratio, lower_ratio, body_ratio = calculate_wick_ratio(kline)
-    position_ratio = float(lower_ratio)  # 下影线占比
 
     logger.debug(
         f"  影线分析：上={float(upper_ratio):.1%} 下={float(lower_ratio):.1%} 实体={float(body_ratio):.1%}"
@@ -64,7 +63,7 @@ def is_bullish_pinbar(kline: KlineData, min_wick: float = 0.5, max_body: float =
         logger.debug(f"  ✗ 实体占比 {float(body_ratio):.1%} > {max_body:.1%}，不满足")
         return False
 
-    # 实体位于 K 线顶部 10% 区间
+    # 实体位置检查（允许在中间）
     open_price = kline.open
     close_price = kline.close
     high = kline.high
@@ -74,31 +73,28 @@ def is_bullish_pinbar(kline: KlineData, min_wick: float = 0.5, max_body: float =
     if total_range == 0:
         return False
 
-    body_top = max(open_price, close_price)
     body_bottom = min(open_price, close_price)
 
-    # 实体底部距离最低价的比例应该 >= 0.8 (即实体位于顶部 20%)
+    # 实体底部距离最低价的比例应该 >= 0.5 - tolerance (默认 0.2，即允许实体进入下半部分 20% 就算)
     position_ratio = (body_bottom - low) / total_range
-    position_tolerance = Decimal("0.1")
 
-    logger.debug(f"  实体位置：{float(position_ratio):.1%} (要求 >= {0.8 - float(position_tolerance):.1%})")
+    logger.debug(f"  实体位置：{float(position_ratio):.1%} (要求 >= {0.5 - body_position_tolerance:.1%})")
 
-    # 实体位于顶部 20% 区间意味着 position_ratio >= 0.8
-    if position_ratio < Decimal("0.8") - position_tolerance:
-        logger.debug(f"  ✗ 实体位置 {float(position_ratio):.1%}，不满足顶部 20% 要求")
+    if position_ratio < Decimal(str(0.5 - body_position_tolerance)):
+        logger.debug(f"  ✗ 实体位置 {float(position_ratio):.1%}，不满足要求")
         return False
 
     logger.debug(f"  ✓ 看涨 Pinbar 确认！下影线={float(lower_ratio):.1%} 实体={float(body_ratio):.1%}")
     return True
 
 
-def is_bearish_pinbar(kline: KlineData, min_wick: float = 0.5, max_body: float = 0.4) -> bool:
+def is_bearish_pinbar(kline: KlineData, min_wick: float = 0.5, max_body: float = 0.35, body_position_tolerance: float = 0.3) -> bool:
     """
-    检测看跌 Pinbar（长上影线，实体在底部）
+    检测看跌 Pinbar（长上影线，实体允许在中间）
     条件:
         - 上影线占比 >= min_wick (默认 50%)
-        - 实体占比 <= max_body (默认 40%)
-        - 实体位于 K 线底部 20% 区间
+        - 实体占比 <= max_body (默认 35%)
+        - 实体位于 K 线上半部分（位置 <= 50% + tolerance，即 <= 80%）
     """
     import logging
     logger = logging.getLogger("dingpang-lite")
@@ -119,7 +115,7 @@ def is_bearish_pinbar(kline: KlineData, min_wick: float = 0.5, max_body: float =
         logger.debug(f"  ✗ 实体占比 {float(body_ratio):.1%} > {max_body:.1%}，不满足")
         return False
 
-    # 实体位于 K 线底部 10% 区间
+    # 实体位置检查（允许在中间）
     open_price = kline.open
     close_price = kline.close
     high = kline.high
@@ -131,14 +127,13 @@ def is_bearish_pinbar(kline: KlineData, min_wick: float = 0.5, max_body: float =
 
     body_top = max(open_price, close_price)
 
-    # 实体顶部距离最低价的比例应该 <= 0.2 (即实体位于底部 20%)
+    # 实体顶部距离最低价的比例应该 <= 0.5 + tolerance (默认 0.8，即允许实体进入上半部分 30%)
     position_ratio = (body_top - low) / total_range
-    position_tolerance = Decimal("0.1")
 
-    logger.debug(f"  实体位置：{float(position_ratio):.1%} (要求 <= {0.2 + float(position_tolerance):.1%})")
+    logger.debug(f"  实体位置：{float(position_ratio):.1%} (要求 <= {0.5 + body_position_tolerance:.1%})")
 
-    if position_ratio > Decimal("0.2") + position_tolerance:
-        logger.debug(f"  ✗ 实体位置 {float(position_ratio):.1%}，不满足底部 20% 要求")
+    if position_ratio > Decimal(str(0.5 + body_position_tolerance)):
+        logger.debug(f"  ✗ 实体位置 {float(position_ratio):.1%}，不满足要求")
         return False
 
     logger.debug(f"  ✓ 看跌 Pinbar 确认！上影线={float(upper_ratio):.1%} 实体={float(body_ratio):.1%}")
@@ -161,14 +156,14 @@ def get_ema_trend(close: Decimal, ema: Decimal) -> Trend:
 
 def calculate_stop_loss(kline: KlineData, direction: Direction) -> Decimal:
     """
-    计算止损价
-    LONG: Pinbar 最低价下方 0.3% (kline.low * 0.997)
-    SHORT: Pinbar 最高价上方 0.3% (kline.high * 1.003)
+    计算止损价（Pinbar 极值点）
+    LONG: Pinbar 最低价
+    SHORT: Pinbar 最高价
     """
     if direction == Direction.LONG:
-        return kline.low * Decimal("0.997")
+        return kline.low
     else:  # SHORT
-        return kline.high * Decimal("1.003")
+        return kline.high
 
 
 def check_pinbar_signal(kline_15m: KlineData, context: dict) -> Optional[SignalResult]:
